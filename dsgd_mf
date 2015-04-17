@@ -1,0 +1,150 @@
+import sys
+from pyspark import SparkContext, SparkConf
+import numpy as np
+from numpy.random import rand
+import csv
+import copy
+
+
+if __name__ == "__main__":
+
+# Read the input variables
+    F = int(sys.argv[1])
+    B = int(sys.argv[2])
+    iter = int(sys.argv[3])
+    beta = float(sys.argv[4])
+    lamb = float(sys.argv[5])
+    wOutput = sys.argv[7]
+    hOutput = sys.argv[8]
+
+# Set up the spark master and environment
+    conf = SparkConf().setAppName('dsgd_mf').setMaster('local')
+    sc = SparkContext(conf=conf)
+
+# Read the dataset matrix V to obtain max(user_id) and max(movie_id)
+    mycsv = file(sys.argv[6], 'rb')
+    reader = csv.reader(mycsv)
+    maxuserid = -100
+    maxmovieid = -100
+    for line in reader:
+        userid = int(line[0])
+        movieid = int(line[1])
+        if userid > maxuserid:
+            maxuserid = userid
+        if movieid > maxmovieid:
+            maxmovieid = movieid
+# Set user number equal to the max(user_id), so does the movie number
+    N = maxuserid
+    M = maxmovieid
+    V = {}
+
+    Ni = [0 for i in range(M)]
+    Nj = [0 for i in range(N)] # Store the N_i* and N_*j for later SGD step
+
+# Read the dataset matrix V again to store in into a dictionary
+    for i in range(B*B):
+        V[i] = []
+    all = 0
+    mycsv2 = file(sys.argv[6], 'rb')
+    reader2 = csv.reader(mycsv2)
+    for line in reader2:
+        userid = int(line[0])
+        movieid = int(line[1])
+        rating = int(line[2])
+        Ni[userid-1] += 1
+        Nj[movieid-1] += 1
+        if (userid-1)/(N/B) == B:
+            n = (B-1)*B
+        else:
+            n = (userid-1)/(N/B) * B
+        if (movieid-1)/(M/B) == B:
+            n += B-1
+        else:
+            n += (movieid-1)/(M/B)
+        V[n].append([userid-1, movieid-1, rating])
+        all += 1
+
+# Randomly initialize matrix W and H
+    W0 = rand(N, F)
+    W = {}
+    for i in range(N):
+        W[i] = list(W0[i, :])
+    H0 = rand(M, F)
+    H = {}
+    for i in range(M):
+        H[i] = list(H0[i, :])
+
+# Broadcast variables to nodes
+    Wb = sc.broadcast(W)
+    Hb = sc.broadcast(H)
+    Vb = sc.broadcast(V)
+    lambb = sc.broadcast(lamb)
+    Fb = sc.broadcast(F)
+    Bb = sc.broadcast(B)
+    Nib = sc.broadcast(Ni)
+    Njb = sc.broadcast(Nj)
+
+# Function for SGD update
+    def update(iterator):
+        for x in iterator:
+            Wb2 = {}
+            Hb2 = {}
+            V2 = Vb.value[x*Bb.value+perb.value[x]]
+            for item in V2:
+                Wb2[item[0]] = copy.deepcopy(Wb.value[item[0]])
+                Hb2[item[1]] = copy.deepcopy(Hb.value[item[1]])
+            ans = []
+            for item in V2:
+                Wi = copy.deepcopy(Wb2[item[0]])
+                Hi = copy.deepcopy(Hb2[item[1]])
+                dot = 0
+                for i in range(Fb.value):
+                    dot += Wi[i] * Hi[i]
+                for i in range(Fb.value):
+                    Wb2[item[0]][i] -= stepb.value*((-2*(item[2] - dot))*Hi[i] + 2*lambb.value/float(Nib.value[item[0]])*Wi[i])
+                    Hb2[item[1]][i] -= stepb.value*((-2*(item[2] - dot))*Wi[i] + 2*lambb.value/float(Njb.value[item[1]])*Hi[i])
+            for item in Wb2.keys():
+                ans.append(['W'+str(item), Wb2[item]])
+            for item in Hb2.keys():
+                ans.append(['H'+str(item), Hb2[item]])
+            return ans
+
+# Main iteration here
+    for i in range(iter):
+        stepSize = (100 + i*all/B) ** (-beta)
+        stepb = sc.broadcast(stepSize)
+        per = np.random.permutation(B)
+        perb = sc.broadcast(per)
+        temp = sc.parallelize(range(B), B) \
+                .mapPartitions(update) \
+                .collect()
+        for subitem in temp:
+            if subitem[0][0] == 'W':
+                userid2 = int(subitem[0][1:])
+                W[userid2] = copy.deepcopy(subitem[1])
+            else:
+                movieid2 = int(subitem[0][1:])
+                H[movieid2] = copy.deepcopy(subitem[1])
+        perb.unpersist()
+        stepb.unpersist()
+        Wb.unpersist()
+        Hb.unpersist()
+        Wb = sc.broadcast(W)   # Rebroadcast updated matrix W
+        Hb = sc.broadcast(H)   # Rebroadcast updated matrix H
+
+# Output matrix W and H to csv file
+    with open(wOutput, 'wb') as mycsvw:
+        writerw = csv.writer(mycsvw)
+        for i in range(N):
+            writerw.writerow(W[i])
+
+    with open(hOutput, 'wb') as mycsvh:
+        writerh = csv.writer(mycsvh)
+        for i in range(F):
+            temp = []
+            for j in range(M):
+                temp.append(H[j][i])
+            writerh.writerow(temp)
+
+# Stop the process
+    sc.stop()
